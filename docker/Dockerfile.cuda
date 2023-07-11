@@ -49,7 +49,6 @@ RUN bash /Install/install_detection_deps.sh
 
 # Copy AITemplate to Docker
 RUN mkdir /AITemplate
-ADD ./COMMIT_INFO /AITemplate/COMMIT_INFO
 ADD ./python /AITemplate/python
 ADD ./3rdparty /AITemplate/3rdparty
 ADD ./examples /AITemplate/examples
