@@ -14,7 +14,7 @@
 #
 # CUDA Docker Image for AITemplate
 
-FROM nvidia/cuda:11.6.2-devel-ubuntu20.04
+FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 
 # Base scripts
 RUN apt-get update --fix-missing
@@ -38,7 +38,7 @@ RUN bash /Install/install_doc_dep.sh
 
 
 # install Pytorch
-RUN pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu113
+RUN --mount=type=cache,target=/root/.cache/pip pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 # install NVIDIA cuda-python
 RUN pip3 install 'cuda-python<12.0.0'
