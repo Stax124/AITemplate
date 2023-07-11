@@ -1,4 +1,4 @@
-name: Docker Build Experimental
+name: Docker Build
 
 on: workflow_dispatch
 
@@ -20,4 +20,4 @@ jobs:
         with:
           push: true
           file: ./docker/Dockerfile.cuda
-          tags: stax124/volta:experimental
+          tags: stax124/aitemplate:latest
