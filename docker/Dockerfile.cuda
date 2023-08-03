@@ -38,7 +38,8 @@ RUN bash /Install/install_doc_dep.sh
 
 
 # install Pytorch
-RUN --mount=type=cache,target=/root/.cache/pip pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+RUN --mount=type=cache,target=/root/.cache/pip pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
 
 # install NVIDIA cuda-python
 RUN pip3 install 'cuda-python<12.0.0'
@@ -58,3 +59,7 @@ ADD ./static /AITemplate/static
 ADD ./licenses /AITemplate/licenses
 ADD ./docker/install/install_ait.sh /AITemplate/
 RUN bash /AITemplate/install_ait.sh
+
+RUN apt install ncdu
+RUN apt purge cuda-nsight-compute* nsight-compute*
+RUN rm -rf /opt/nvidia
