@@ -60,6 +60,5 @@ ADD ./licenses /AITemplate/licenses
 ADD ./docker/install/install_ait.sh /AITemplate/
 RUN bash /AITemplate/install_ait.sh
 
-RUN apt install ncdu
-RUN apt purge cuda-nsight-compute* nsight-compute*
-RUN rm -rf /opt/nvidia
+RUN apt install ncdu -y
+RUN apt purge cuda-nsight-compute* nsight-compute* -y
