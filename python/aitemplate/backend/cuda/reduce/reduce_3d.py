@@ -28,6 +28,7 @@ from aitemplate.backend.backend_spec import CUDASpec
 from aitemplate.backend.common import tensor_accessor_codegen
 
 from aitemplate.backend.cuda.reduce import reduce_small_axis
+from aitemplate.backend.target import Target
 
 
 DEFAULT_PROLOGUE_TEMPLATE = jinja2.Template(
@@ -322,7 +323,17 @@ struct ReductionKernel3D {
     ReduceScalarOp reduce_s_op;
 
     FragmentCompute frag_compute;
+
+{% if reduction_identity == 'ElementCompute()' %}
+    // initialize the frag_compute with default values
     frag_compute.clear();
+{% else %}
+    // need to initialize the frag_compute with the specific
+    // reduction_identity values, as those are likely non-default
+    for (int i = 0; i < kAlignment; ++i) {
+      frag_compute[i] = {{reduction_identity}};
+    }
+{% endif %}
 
     if (idx_m < args.extent.row()) {
 
@@ -413,7 +424,7 @@ struct ReductionKernel3D {
     // Tree reduction
     ElementCompute *smem_ptr = shared_storage.exchange.data() + threadIdx.y * Shape::kColumn;
 
-    ElementCompute result = ElementCompute();
+    ElementCompute result = {{reduction_identity}};
 
     CUTLASS_PRAGMA_UNROLL
     for (
@@ -464,7 +475,7 @@ struct ReductionKernel3D {
 
       // Certain shape combinations require an additional reduction step
       if (kLgResidual) {
-        result = ElementCompute();
+        result = {{reduction_identity}};
 
         int const kResidualVector = (1 << kLgResidual);
         cutlass::Array<ElementCompute, kResidualVector> fetch;
@@ -799,6 +810,7 @@ def gen_function(
     epilogue_scalar_template=DEFAULT_EPILOGUE_SCALAR_TEMPLATE,
     extra_code_str="",
     accumulation_type=None,
+    reduction_identity="ElementCompute()",
 ) -> str:
     """a common function for generating a reduce-family kernel
 
@@ -830,7 +842,13 @@ def gen_function(
     output_type = backend_spec.dtype_to_lib_type(y._attrs["dtype"])
     if accumulation_type is None:
         # follow pytorch's semantics
-        acc_type = output_type
+        if (
+            Target.current()._kwargs.get("use_fp16_acc", False)
+            and y._attrs["dtype"] == "float16"
+        ):
+            acc_type = output_type
+        else:
+            acc_type = "float"
     else:
         acc_type = accumulation_type
 
@@ -920,6 +938,7 @@ def gen_function(
         acc_type,
         output_accessors,
         output_alignment,
+        reduction_identity,
     )
     exec_paths = EXEC_COND_TEMPLATE.render(
         indent="  ",
@@ -943,6 +962,7 @@ def gen_function(
     kernel_src = KERNEL_SRC_TEMPLATE.render(
         extra_code=extra_code_str,
         reduce_op=reduce_op,
+        reduction_identity=reduction_identity,
         reduce_kernel_instance=reduce_instance,
         alignments=alignments,
         prologue_code=prologue_code,

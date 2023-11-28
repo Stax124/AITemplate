@@ -767,6 +767,50 @@ def addmm_mapper(node: torch.fx.Node, _: nn.Module) -> torch.fx.Node:
 
 
 @register_custom_acc_mapper_fn(
+    op_and_target=("call_function", torch.addcmul),
+    arg_replacement_tuples=[
+        ("input", "input"),
+        ("tensor1", "tensor1"),
+        ("tensor2", "tensor2"),
+        ("value", "value"),
+    ],
+)
+def addcmul_mapper(node: torch.fx.Node, _: nn.Module) -> torch.fx.Node:
+    """
+    Mapping from torch.addcmul to acc_ops.mul and acc_ops.add. If value is not 1, then we do another acc_ops.mul again.
+    """
+
+    with node.graph.inserting_before(node):
+        mul_kwargs = {"input": node.kwargs["tensor1"], "other": node.kwargs["tensor2"]}
+        mul_node = node.graph.create_node(
+            "call_function", mul, kwargs=mul_kwargs, name=f"{node.name}_mul"
+        )
+        mul_node.meta = node.meta.copy()
+
+        input_node = mul_node
+        if node.kwargs["value"] != 1:
+            value_mul_kwargs = {"input": input_node, "other": node.kwargs["value"]}
+            new_input_node = node.graph.create_node(
+                "call_function",
+                mul,
+                kwargs=value_mul_kwargs,
+                name="{mul_node.name}_value_mul",
+            )
+            new_input_node.meta = input_node.meta.copy()
+            input_node = new_input_node
+
+        add_kwargs = {
+            "input": node.kwargs["input"],
+            "other": input_node,
+        }
+        add_node = node.graph.create_node(
+            "call_function", add, kwargs=add_kwargs, name=f"{node.name}_add"
+        )
+        add_node.meta = node.meta.copy()
+        return add_node
+
+
+@register_custom_acc_mapper_fn(
     op_and_target=("call_function", torch.t),
     arg_replacement_tuples=[
         ("input", "input"),
@@ -812,20 +856,12 @@ def permute(*, input, permutation):
     return input.permute(*permutation)
 
 
-@register_custom_acc_mapper_fn(
+@register_acc_op_mapping(
     op_and_target=("call_function", torch.square),
-    arg_replacement_tuples=[
-        ("input", "input"),
-    ],
 )
-def square_mapper(node: torch.fx.Node, _: nn.Module) -> torch.fx.Node:
-    input_node = node.kwargs["input"]
-    with node.graph.inserting_before(node):
-        new_node = node.graph.call_function(
-            mul, kwargs={"input": input_node, "other": input_node}
-        )
-        new_node.meta = node.meta.copy()
-        return new_node
+@register_acc_op
+def square(input):
+    return torch.square(input)
 
 
 @register_acc_op_mapping(
@@ -1512,6 +1548,22 @@ def max_dim_reduce(*, input, dim=None, keepdim=False):
     return torch.max(input=input, dim=dim, keepdim=keepdim)
 
 
+@register_acc_op_properties(AccOpProperty.unary)
+@register_acc_op_mapping(op_and_target=("call_function", torch.amax))
+@register_acc_op_mapping(op_and_target=("call_method", "amax"))
+@register_acc_op
+def amax(*, input, dim, keepdim=False):
+    return torch.amax(input=input, dim=dim, keepdim=keepdim)
+
+
+@register_acc_op_properties(AccOpProperty.unary)
+@register_acc_op_mapping(op_and_target=("call_function", torch.amin))
+@register_acc_op_mapping(op_and_target=("call_method", "amin"))
+@register_acc_op
+def amin(*, input, dim, keepdim=False):
+    return torch.amin(input=input, dim=dim, keepdim=keepdim)
+
+
 @register_acc_op_properties(AccOpProperty.pointwise)
 @register_acc_op_mapping(op_and_target=("call_function", torch.maximum))
 @register_acc_op_mapping(op_and_target=("call_method", "maximum"))
@@ -2094,6 +2146,14 @@ def norm_mapper(node: torch.fx.Node, _: torch.nn.Module) -> torch.fx.Node:
     op_and_target=("call_method", "split_with_sizes"),
     arg_replacement_tuples=[
         ("tensor", "input"),
+        ("split_sizes", "split_size_or_sections"),
+        ("dim", "dim"),
+    ],
+)
+@register_custom_acc_mapper_fn(
+    op_and_target=("call_function", torch.split_with_sizes),
+    arg_replacement_tuples=[
+        ("input", "input"),
         ("split_sizes", "split_size_or_sections"),
         ("dim", "dim"),
     ],

@@ -338,6 +338,9 @@ class ModelContainerGenerator:
         self.target = Target.current()
         self.f_var_decl = registry.get(self.target.name() + ".lib.var_decl")
         self.f_ptr_decl = registry.get(self.target.name() + ".lib.void_ptr_decl")
+        self.dtype_to_backend_type = registry.get(
+            self.target.name() + ".lib.dtype_to_backend_type"
+        )
 
         self.constants_data_file = constants_data_file
 
@@ -367,7 +370,7 @@ class ModelContainerGenerator:
         self.visited_func = set()
         self.visited_dims = set()
         self.set_up_constant_names = []
-        self.param_name_to_ptr_idx = {}
+        self.set_up_constant_original_names = []
 
         self.num_constants = 0
         self.constants_data_size = 0
@@ -386,11 +389,9 @@ class ModelContainerGenerator:
         self.graph = graph
 
         self.num_inputs, self.num_outputs = count_inputs_outputs(graph)
-        (self.max_blob_size, self.max_constant_blob_size, self.workspace,) = (
-            max_blob_size,
-            max_constant_blob_size,
-            workspace,
-        )
+        self.max_blob_size = max_blob_size
+        self.max_constant_blob_size = max_constant_blob_size
+        self.workspace = workspace
 
         self.debug_settings = (
             AITDebugSettings() if debug_settings is None else debug_settings
@@ -495,6 +496,14 @@ class ModelContainerGenerator:
                 self.bound_constant_idx,
             )
         )
+        original_name = tensor._attrs.get("original_name")
+        if original_name is not None:
+            self.set_up_constant_original_names.append(
+                set_value(
+                    f'constant_name_to_original_name_["{name}"]',
+                    f'"{original_name}"',
+                )
+            )
         self.set_up_bound_constant_dtypes.append(
             set_value(
                 f"bound_constant_dtypes_[{self.bound_constant_idx}]",
@@ -557,6 +566,14 @@ class ModelContainerGenerator:
                     self.unbound_constant_idx,
                 )
             )
+            original_name = tensor._attrs.get("original_name")
+            if original_name is not None:
+                self.set_up_constant_original_names.append(
+                    set_value(
+                        f'constant_name_to_original_name_["{name}"]',
+                        f'"{original_name}"',
+                    )
+                )
             self._record_param_tensor_info(
                 tensor,
                 self.unbound_constant_idx + self.num_inputs + self.num_outputs,
@@ -583,7 +600,6 @@ class ModelContainerGenerator:
             )
         )
         self.set_inputs.append(check_not_null(tensor))
-        self.param_name_to_ptr_idx[name] = self.input_idx
         self._record_param_tensor_info(tensor, self.input_idx)
         self.input_idx += 1
 
@@ -598,27 +614,25 @@ class ModelContainerGenerator:
     def _codegen_output_aliases_tensor(self, tensor: Tensor) -> None:
         name = tensor._attrs["name"]
         view = tensor._attrs["is_view_of"]
-        if tensor._attrs["external_tensor"] is not None:
+        external_tensor = tensor._attrs["external_tensor"]
+        if external_tensor is not None:
+            assert not external_tensor._attrs[
+                "is_param"
+            ], "Views of constants should be folded."
             self.set_inputs.append(set_value(name, view._attrs["name"]))
             return
-        is_view = view is not None
-        if is_view and (view._attrs["name"] in self.param_name_to_ptr_idx):
-            ptr_idx = self.param_name_to_ptr_idx[view._attrs["name"]]
+
+        if view:
+            # View is already initialized, assign to view.
             self.set_inputs.append(set_value(name, view._attrs["name"]))
         else:
-            ptr_idx = self._get_output_idx(name)
+            # Original tensor, initialize it.
+            output_idx = self._get_output_idx(name)
             self.set_inputs.append(
                 set_value(
                     name,
-                    f"static_cast<decltype({name})>(params_[{ptr_idx}].ptr)",
+                    f"static_cast<decltype({name})>(params_[{output_idx}].ptr)",
                 )
-            )
-
-        self.param_name_to_ptr_idx[name] = ptr_idx
-        if tensor._attrs["is_output"]:
-            self._record_param_tensor_info(tensor, ptr_idx)
-            self.set_inputs.append(
-                check_not_null(tensor, skip_if_lower_bound_is_zero=True)
             )
 
     def _codegen_output_tensor(self, tensor: Tensor) -> None:
@@ -633,7 +647,6 @@ class ModelContainerGenerator:
 
         if is_param:
             self._codegen_param_setup(tensor)
-            self._record_param_tensor_info(tensor, output_idx)
             self.device_to_device_copies.append(device_copy(tensor, tensor, output_idx))
         elif external_tensor is not None:
             # Special view cases for outputs; we can hit this case if the output
@@ -648,7 +661,6 @@ class ModelContainerGenerator:
             self.device_to_device_copies.append(
                 device_copy(tensor, external_tensor, output_idx)
             )
-            self._record_param_tensor_info(tensor, output_idx)
         elif is_input:
             # Inputs that are also outputs require an extra copy
             self.set_inputs.append(
@@ -658,11 +670,25 @@ class ModelContainerGenerator:
                 )
             )
             self._record_param_tensor_info(tensor, self.input_idx)
-            self._record_param_tensor_info(tensor, output_idx)
             self.device_to_device_copies.append(device_copy(tensor, tensor, output_idx))
             self.input_idx += 1
+        elif is_view:
+            self.set_inputs.append(set_value(name, view._attrs["name"]))
+            self.set_inputs.append(
+                check_not_null(tensor, skip_if_lower_bound_is_zero=True)
+            )
         else:
-            self._codegen_output_aliases_tensor(tensor)
+            self.set_inputs.append(
+                set_value(
+                    name,
+                    f"static_cast<decltype({name})>(params_[{output_idx}].ptr)",
+                )
+            )
+            self.set_inputs.append(
+                check_not_null(tensor, skip_if_lower_bound_is_zero=True)
+            )
+
+        self._record_param_tensor_info(tensor, output_idx)
 
     def _process_dims(self, shape: List[IntVar]) -> None:
         for dim in shape:
@@ -773,13 +799,15 @@ class ModelContainerGenerator:
                     self.state_record.add(func._attrs["name"])
             self._process_dims_for_op(func)
 
-        if self.debug_settings.check_all_nan_and_inf or node._attrs.get(
-            "check_nan_and_inf", False
-        ):
+        if (
+            self.debug_settings.check_all_nan_and_inf
+            or node._attrs.get("check_nan_and_inf", False)
+        ) and (not isinstance(node, IntVarTensor)):
             self._append_check_nan_and_inf(node)
-        if self.debug_settings.check_all_outputs or node._attrs.get(
-            "check_outputs", False
-        ):
+        if (
+            self.debug_settings.check_all_outputs
+            or node._attrs.get("check_outputs", False)
+        ) and (not isinstance(node, IntVarTensor)):
             self._append_check_outputs(node)
 
     def _append_check_nan_and_inf(self, node: Tensor):
@@ -798,7 +826,11 @@ class ModelContainerGenerator:
         elem_cnt = "*".join([shape.pseudo_code() for shape in node.shape()])
         self.func_name_seq.append("output_check")
 
-        code_text = f'    InvokeOutputsChecker(reinterpret_cast<half*>({tensor_name}), "{tensor_name}", {elem_cnt}, stream);\n'
+        backend_type = self.dtype_to_backend_type(node._attrs["dtype"])
+        code_text = (
+            f"    InvokeOutputsChecker((const {backend_type}*)({tensor_name}), "
+            f'"{tensor_name}", {elem_cnt}, stream);\n'
+        )
         self.func_seq.append(code_text)
         self._rendered_checks_func_code.append(code_text)
 
@@ -870,7 +902,7 @@ class ModelContainerGenerator:
 
         # sort all operators by parallel execution order
         ops_by_order = defaultdict(list)
-        for (op, tracking) in time_stats.op_parallel_trackers.items():
+        for op, tracking in time_stats.op_parallel_trackers.items():
             ops_by_order[tracking.execution_order].append(op)
 
         # convert Dict[int, List[Operator]] into List[List[Operator]]
@@ -1047,6 +1079,9 @@ class ModelContainerGenerator:
             num_outputs=self.num_outputs,
             param_size=self.max_constant_blob_size + self.extra_owned_constant_size,
             set_up_constant_names="\n".join(self.set_up_constant_names),
+            set_up_constant_original_names="\n".join(
+                self.set_up_constant_original_names
+            ),
             set_up_param_dtypes="\n".join(self.set_up_param_dtypes),
             set_up_bound_constant_dtypes="\n".join(self.set_up_bound_constant_dtypes),
             set_up_bound_constant_size="\n".join(self.set_up_bound_constant_size),
@@ -1081,6 +1116,14 @@ class ModelContainerGenerator:
                     self.unbound_constant_idx,
                 )
             )
+            original_name = tensor._attrs.get("original_name")
+            if original_name is not None:
+                self.set_up_constant_original_names.append(
+                    set_value(
+                        f'constant_name_to_original_name_["{name}"]',
+                        f'"{original_name}"',
+                    )
+                )
             self._record_param_tensor_info(
                 tensor,
                 self.unbound_constant_idx + self.num_inputs + self.num_outputs,

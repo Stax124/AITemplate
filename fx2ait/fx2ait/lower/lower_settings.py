@@ -83,3 +83,11 @@ class LowerSettings:
     load_ait_dir: Optional[str] = None
     # jit.trace AITModule
     trace_ait_module: bool = True
+    # If True, optimize for compilation time (ie. compile w/ -O1 rather than -O3 and skip profiling codegen)
+    optimize_for_compilation_time: bool = False
+    # If True, use tanh to approximate sigmoid in CUDA kernels
+    use_tanh_for_sigmoid: bool = False
+    # generate cutlass sm90 kernels alongside sm80 kernels on sm90 arch
+    allow_cutlass_sm90: bool = False
+    # only generate cutlass sm90 kernels on sm90 arch
+    force_cutlass_sm90: bool = False

@@ -16,9 +16,10 @@
 Perform operator fusions.
 """
 import collections
+import itertools
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from aitemplate.compiler.base import Operator, Tensor
 from aitemplate.compiler.ops.common import elementwise, fused_elementwise
@@ -38,39 +39,40 @@ _LOGGER = logging.getLogger(__name__)
 
 class SimpleDisjointSet:
     def __init__(self):
-        self.node_to_list_mapping: Dict[Any, List[Any]] = {}
+        self.node_to_set_mapping: Dict[Any, Set[Any]] = {}
 
-    def add(self, node: Any, dependent_nodes: Set[Any]) -> None:
-        if node in self.node_to_list_mapping:
+    def add(self, node: Any, dependent_nodes: Optional[Set[Any]]) -> None:
+        if node in self.node_to_set_mapping:
             return
 
         if dependent_nodes is None or len(dependent_nodes) == 0:
-            self.node_to_list_mapping[node] = [node]
+            self.node_to_set_mapping[node] = {node}
             return
 
-        current_list = [
-            node  # node should also be considered to decide if a new_list can be added.
-        ]
-        for dependent in list(dependent_nodes):
-            if dependent is None or dependent not in self.node_to_list_mapping:
+        current_set = {
+            node  # node should also be considered to decide if a new_set can be added.
+        }
+        for dependent in dependent_nodes:
+            if dependent is None or dependent not in self.node_to_set_mapping:
                 continue
-            new_list = self.node_to_list_mapping.get(dependent)
+            new_set = self.node_to_set_mapping.get(dependent)
 
-            if _detect_cycle(current_list + new_list):
+            if _detect_cycle(current_set | new_set):
                 continue
-            current_list.extend(new_list)
-            for new_node in new_list:
-                self.node_to_list_mapping[new_node] = current_list
-        self.node_to_list_mapping[node] = current_list
 
-    def get_node_groups(self) -> List[List[Any]]:
+            current_set.update(new_set)
+            for new_node in new_set:
+                self.node_to_set_mapping[new_node] = current_set
+        self.node_to_set_mapping[node] = current_set
+
+    def get_node_groups(self) -> List[Set[Any]]:
         node_groups = []
         visited = set()
-        for groups in self.node_to_list_mapping.values():
-            addr = id(groups)
+        for group in self.node_to_set_mapping.values():
+            addr = id(group)
             if addr not in visited:
                 visited.add(addr)
-                node_groups.append(groups)
+                node_groups.append(group)
         return node_groups
 
 
@@ -140,13 +142,13 @@ def _find_fusable_elementwise_ops(op: Operator) -> Set[Operator]:
 @dataclass
 class FusedElementwiseInfo:
     partitioned_ops: List[Operator]
-    inputs: Set[Tensor]
-    outputs: Set[Tensor]
-    external_inputs: Set[Tensor]
-    external_outputs: Set[Tensor]
+    inputs: List[Tensor]
+    outputs: List[Tensor]
+    external_inputs: List[Tensor]
+    external_outputs: List[Tensor]
 
 
-def _partition_subgraphs(ops: List[Operator]) -> Dict[str, Set[Operator]]:
+def _partition_subgraphs(ops: Set[Operator]) -> Dict[str, Set[Operator]]:
     """
     Given ops of candidate graph of fused_elementwise op graph and partition
     into subgraph based on output shape, returns dict of
@@ -177,47 +179,51 @@ def _partition_subgraphs(ops: List[Operator]) -> Dict[str, Set[Operator]]:
 
 def _get_inputs_outputs(
     partitioned_ops: Set[Operator], all_ops: Set[Operator]
-) -> List[Set[Tensor]]:
+) -> List[List[Tensor]]:
     """
     Given ops of a partitioned subgraph based on output shape, and ops of full graph
     to form a complete graph with fused_elementwise op, returns all inputs/outputs of
     the ops and the external input/output of the subgraph, which will serve as input/output
     of fused_elementwise op.
     """
-    external_inputs = set()
-    external_outputs = set()
-    tmp_inputs = set()
-    tmp_outputs = set()
+    external_inputs, external_outputs = [], []
+    tmp_inputs, tmp_outputs = [], []
 
     for op in partitioned_ops:
         for input_tensor in op._attrs["inputs"]:
-            tmp_inputs.add(input_tensor)
+            tmp_inputs.append(input_tensor)
             src_ops = set(input_tensor._attrs["src_ops"])
             if (len(src_ops) == 0 or len(src_ops - all_ops) > 0) and (
                 not input_tensor.is_a_const_num()
             ):
-                external_inputs.add(input_tensor)
+                external_inputs.append(input_tensor)
             assert op in input_tensor._attrs["dst_ops"]
         for output_tensor in op._attrs["outputs"]:
-            tmp_outputs.add(output_tensor)
+            tmp_outputs.append(output_tensor)
             dst_ops = set(output_tensor._attrs["dst_ops"])
             if output_tensor._attrs["is_output"] or len(dst_ops - all_ops) > 0:
-                external_outputs.add(output_tensor)
+                external_outputs.append(output_tensor)
             assert len(output_tensor._attrs["src_ops"]) == 1
             assert list(output_tensor._attrs["src_ops"])[0] == op
 
-    assert (
-        external_inputs == tmp_inputs - tmp_outputs
+    # dict.fromkeys takes unique tensors and preserves the ordering.
+    external_inputs = list(dict.fromkeys(external_inputs))
+    external_outputs = list(dict.fromkeys(external_outputs))
+    tmp_inputs = list(dict.fromkeys(tmp_inputs))
+    tmp_outputs = list(dict.fromkeys(tmp_outputs))
+
+    assert set(external_inputs) == set(tmp_inputs) - set(
+        tmp_outputs
     ), "external_inputs: {} is not equal to tmp_inputs: {} - tmp_outputs: {}.".format(
         external_inputs, tmp_inputs, tmp_outputs
     )
     assert (
-        len(tmp_outputs - tmp_inputs - external_outputs) == 0
+        len(set(tmp_outputs) - set(tmp_inputs) - set(external_outputs)) == 0
     ), "tmp_outputs: {} - tmp_inputs: {} - external_outputs: {} is not empty.".format(
         tmp_outputs, tmp_inputs, external_outputs
     )
     assert (
-        len(external_outputs - tmp_outputs) == 0
+        len(set(external_outputs) - set(tmp_outputs)) == 0
     ), "external_outputs: {} - tmp_outputs: {} is not empty.".format(
         external_outputs, tmp_outputs
     )
@@ -273,7 +279,7 @@ def _create_fuse_ops(info_list: List[FusedElementwiseInfo]) -> None:
     """
     for info in info_list:
         op_set = set(info.partitioned_ops)
-        for tensor in info.inputs | info.outputs:
+        for tensor in itertools.chain(info.inputs, info.outputs):
             tensor._attrs["src_ops"] = tensor._attrs["src_ops"] - op_set
             tensor._attrs["dst_ops"] = tensor._attrs["dst_ops"] - op_set
         fused_elementwise(
@@ -283,7 +289,7 @@ def _create_fuse_ops(info_list: List[FusedElementwiseInfo]) -> None:
         )
 
 
-def _detect_cycle(group: List[Operator]) -> bool:
+def _detect_cycle(group: Set[Operator]) -> bool:
     """
     Given a group of ops, to detect if they would form cycles, i.e.
       --> group_ops
@@ -294,7 +300,7 @@ def _detect_cycle(group: List[Operator]) -> bool:
     """
     parents = [o for op1 in group for i in op1._attrs["inputs"] for o in i.src_ops()]
     for op1 in group:
-        for op2 in set(parents) - set(group):
+        for op2 in set(parents) - group:
             if transform_utils.is_ancestor(op1, op2):
                 return True
     return False
@@ -322,7 +328,7 @@ def fuse_elementwise(sorted_graph: List[Tensor], workdir: str = None) -> List[Te
         # Partition subgraph based on output shape.
         output_op_map = _partition_subgraphs(ops)
         # Collect information to create fuse ops.
-        info_list = _collect_info(output_op_map, set(ops), sorted_graph)
+        info_list = _collect_info(output_op_map, ops, sorted_graph)
         # Create fuse ops.
         _create_fuse_ops(info_list)
 

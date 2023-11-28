@@ -56,6 +56,21 @@ def lower_precision_to_torch_type(
         raise ValueError(f"Unsupported precision: {precision}")
 
 
+def torch_type_to_lower_precision(
+    dtype: torch.dtype,
+) -> LowerPrecision:
+    if dtype == torch.float16:
+        return LowerPrecision.FP16
+    elif dtype == torch.bfloat16:
+        return LowerPrecision.BF16
+    elif dtype == torch.float:
+        return LowerPrecision.FP32
+    elif dtype == torch.int8:
+        return LowerPrecision.INT8
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+
 def fetch_attr(mod, target):
     """
     Fetch an attribute from the ``Module`` hierarchy of ``mod.module``.
@@ -99,6 +114,7 @@ class AITTestCase(TestCase):
         leaf_module: Callable = None,  # one leaf module
         apply_passes_to_lowered_module_only=False,
         use_fp16_acc=True,
+        fail_on_nan=False,
     ):
         # TODO: add precision to interpreter once AIT supports multiple precision level
         # TODO: @qxy11 remove permute options once AIT supports channels-first format
@@ -221,7 +237,7 @@ class AITTestCase(TestCase):
                     rtol=rtol,
                     atol=atol,
                     check_dtype=False,
-                    equal_nan=True,
+                    equal_nan=not fail_on_nan,
                 )
 
     def run_test_with_dynamic_shape(
@@ -387,15 +403,34 @@ def benchmark_function(
     mod: torch.nn.Module,
     inputs: List[torch.Tensor],
     permute_inputs: Optional[List[int]] = None,
+    precision: LowerPrecision = LowerPrecision.FP16,
+    leaf_module: Callable = None,
 ) -> float:
     mod.eval()
+
+    leaf_module_list = []
+    if leaf_module:
+        if isinstance(leaf_module, list):
+            leaf_module_list.extend(leaf_module)
+        else:
+            leaf_module_list.append(leaf_module)
+
     mod = acc_tracer.trace(
         mod,
         inputs,
+        leaf_module_list=leaf_module_list,
     )
     original_inputs = inputs
     if permute_inputs:
         inputs = [inp.permute(*permute_inputs).contiguous() for inp in inputs]
+    torch_dtype = lower_precision_to_torch_type(precision)
+    mod.to(torch_dtype)
+    inputs = map_aggregate(
+        inputs,
+        lambda inp: inp.to(torch_dtype).contiguous()
+        if inp.dtype not in (torch.bool, torch.int64)
+        else inp.contiguous(),
+    )
     interp = AITInterpreter(
         mod,
         inputs,

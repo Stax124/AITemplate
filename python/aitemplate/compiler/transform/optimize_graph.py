@@ -22,6 +22,9 @@ from aitemplate.compiler.transform.apply_padding import apply_padding
 from aitemplate.compiler.transform.dedup_make_jagged_ops import dedup_make_jagged_ops
 from aitemplate.compiler.transform.fuse_bmm_permute import fuse_bmm_permute
 from aitemplate.compiler.transform.fuse_conv_elementwise import fuse_conv_elementwise
+from aitemplate.compiler.transform.fuse_duplicate_fused_elementwise import (
+    fuse_duplicate_fused_elementwise,
+)
 from aitemplate.compiler.transform.fuse_expand_bmm import fuse_expand_bmm
 from aitemplate.compiler.transform.fuse_group_ops import fuse_group_ops
 from aitemplate.compiler.transform.fuse_mm_elementwise import fuse_mm_elementwise
@@ -41,16 +44,17 @@ from aitemplate.compiler.transform.move_view_ops import move_view_op_before_conc
 from aitemplate.compiler.transform.remove_elementwise_no_ops import (
     remove_elementwise_no_ops,
 )
-from aitemplate.compiler.transform.remove_id_ops import remove_id_ops
 from aitemplate.compiler.transform.split_large_concat_ops import split_large_concat_ops
 from aitemplate.compiler.transform.split_large_slice_scatter_ops import (
     split_large_slice_scatter_ops,
 )
 from aitemplate.compiler.transform.split_large_split_ops import split_large_split_ops
 from aitemplate.compiler.transform.transform_memory_ops import transform_memory_ops
+from aitemplate.compiler.transform.transform_merge_view_ops import merge_view_ops
 from aitemplate.compiler.transform.transform_odd_alignment import (
     transform_odd_alignment,
 )
+from aitemplate.compiler.transform.transform_permutations import eliminate_permutations
 from aitemplate.compiler.transform.transform_permute_to_reshape import (
     transform_permute_to_reshape,
 )
@@ -93,7 +97,6 @@ def optimize_graph(
     """
 
     funcs = [
-        remove_id_ops,
         remove_elementwise_no_ops,
         dedup_make_jagged_ops,
         fuse_permute_bmm_and_gemm,
@@ -105,6 +108,7 @@ def optimize_graph(
         fuse_mm_reshape_permute,
         # make sure we run move_view_op_before_concat before transform_memory_ops
         move_view_op_before_concat,
+        merge_view_ops,
         transform_memory_ops,
         fuse_ops,
         fuse_elementwise,
@@ -125,8 +129,10 @@ def optimize_graph(
         split_large_split_ops,
         transform_permute_to_reshape,
         transform_memory_ops,
-        # FIXME: temporarily disable this due to some accuracy issue
-        # eliminate_permutations,
+        eliminate_permutations,
+        # fuse_duplicate_fused_elementwise must run after elementwise fusion and
+        # after passes that modify/replace a fused_elementwise's input/output accessor.
+        fuse_duplicate_fused_elementwise,
     ]
 
     if not optimize:

@@ -49,6 +49,8 @@ class AITInterpreterResult(NamedTuple):
     input_names: Sequence[str]
     output_names: Sequence[str]
     fx_input_names: Sequence[str] = []
+    input_dtypes: Sequence[str] = []
+    output_dtypes: Sequence[str] = []
 
 
 class AITInterpreter(torch.fx.Interpreter):
@@ -69,7 +71,11 @@ class AITInterpreter(torch.fx.Interpreter):
         save_remote_cache: Optional[bool] = False,
         do_optimize_graph: bool = True,
         use_fast_math: bool = True,
-        profile_timeout: int = 300,
+        use_tanh_for_sigmoid: bool = False,
+        profile_timeout: int = 500,
+        optimize_for_compilation_time: bool = False,
+        allow_cutlass_sm90: bool = False,
+        force_cutlass_sm90: bool = False,
     ):
         """
         Args:
@@ -88,7 +94,11 @@ class AITInterpreter(torch.fx.Interpreter):
             remote_cache_file_path: AITemplate profiling cache location
             save_remote_cache: whether to save the updated cache
             use_fast_math: whether to use fast math in CUDA kernels
+            use_tanh_for_sigmoid: whether to use tanh to approximate sigmoid in CUDA kernels
+            allow_cutlass_sm90: generate cutlass sm90 kernels alongside sm80 kernels on sm90 arch
+            force_cutlass_sm90: only generate cutlass sm90 kernels on sm90 arch
             profile_timeout: timeout in seconds for AIT profilers to complete
+            optimize_for_compilation_time: we use O1 and disable the ProfileImpl function to reduce compilation time.
         """
         super().__init__(module)
 
@@ -112,6 +122,10 @@ class AITInterpreter(torch.fx.Interpreter):
             _LOGGER.info(f"Set CACHE_DIR to {self.cache_dir}")
         self.use_fp16_acc = use_fp16_acc
         self.use_fast_math = use_fast_math
+        self.use_tanh_for_sigmoid = use_tanh_for_sigmoid
+        self.allow_cutlass_sm90 = allow_cutlass_sm90
+        self.force_cutlass_sm90 = force_cutlass_sm90
+        self.optimize_for_compilation_time = optimize_for_compilation_time
         self.hardware_target = self._create_target()
         self.input_specs = input_specs
         self.input_specs_iter = 0
@@ -122,7 +136,9 @@ class AITInterpreter(torch.fx.Interpreter):
         self.profile_devs = profile_devs
 
         self._input_names: List[str] = []
+        self._input_dtypes: List[str] = []
         self._output_names: List[str] = []
+        self._output_dtypes: List[str] = []
         self._fx_input_names: List[str] = []
         self._loaded_params: Dict[str, AITTensor] = {}
 
@@ -138,6 +154,10 @@ class AITInterpreter(torch.fx.Interpreter):
             use_fp16_acc=self.use_fp16_acc,
             remote_cache_bytes=self.remote_cache_bytes,
             use_fast_math=self.use_fast_math,
+            use_tanh_for_sigmoid=self.use_tanh_for_sigmoid,
+            allow_cutlass_sm90=self.allow_cutlass_sm90,
+            force_cutlass_sm90=self.force_cutlass_sm90,
+            optimize_for_compilation_time=self.optimize_for_compilation_time,
         )
 
     def _load_profile_cache(self) -> bytes:
@@ -244,6 +264,11 @@ class AITInterpreter(torch.fx.Interpreter):
             for n in self.engine.debug_sorted_graph
             if n._attrs["is_input"]
         ]
+        ait_input_dtypes = {
+            n._attrs["name"]: n._attrs["dtype"]
+            for n in self.engine.debug_sorted_graph
+            if n._attrs["is_input"]
+        }
         for name in ait_input_names:
             assert (
                 self._fx_input_names.count(name) == 1
@@ -252,6 +277,7 @@ class AITInterpreter(torch.fx.Interpreter):
         for name in self._fx_input_names:
             if name in ait_input_names:
                 self._input_names.append(name)
+                self._input_dtypes.append(ait_input_dtypes[name])
 
         for i, input_name in enumerate(self._fx_input_names):
             _LOGGER.info("Set input{}: {}".format(i, input_name))
@@ -267,6 +293,8 @@ class AITInterpreter(torch.fx.Interpreter):
             self._input_names,
             self._output_names,
             self._fx_input_names,
+            self._input_dtypes,
+            self._output_dtypes,
         )
 
     def run_node(self, n):
@@ -331,7 +359,10 @@ class AITInterpreter(torch.fx.Interpreter):
 
         data = _TorchConstantTensorData(ait_val)
         tensor = AITTensor(
-            shape=attr_val.shape, dtype=ait_dtype, name=ait_friendly_name
+            shape=attr_val.shape,
+            dtype=ait_dtype,
+            name=ait_friendly_name,
+            original_name=target,
         )
         tensor._bind_data(data)
         self._loaded_params[ait_friendly_name] = tensor
@@ -388,5 +419,6 @@ class AITInterpreter(torch.fx.Interpreter):
             output._attrs["name"] = name
             output._attrs["is_output"] = True
             self._output_names.append(name)
+            self._output_dtypes.append(output._attrs["dtype"])
 
         return outputs

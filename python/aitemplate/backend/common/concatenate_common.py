@@ -15,10 +15,14 @@
 """
 backend concatenate function common templates.
 """
+from typing import List
+
 import jinja2
 
 from aitemplate.backend.common import tensor_accessor_codegen
+from aitemplate.backend.target import Target
 
+from aitemplate.compiler.base import IntImm
 from aitemplate.compiler.ops.tensor import concatenate
 
 FUNC_DECL_TEMPLATE = jinja2.Template(
@@ -528,6 +532,61 @@ INPUT_SHAPE_DEF_TEMPLATE = jinja2.Template(
 )
 
 
+INITIALIZATION_LOOP_TEMPLATE = jinja2.Template(
+    """
+{{indent}}  for(int {{var_name}}_idx_ = {{start_idx}}; {{var_name}}_idx_ < {{end_idx}}; {{var_name}}_idx_++) {
+{{indent}}      {{var_name}}[{{var_name}}_idx_] = {{init_val}};
+{{indent}}  }
+"""
+)
+
+
+FUNC_CALL_TEMPLATE_OPT = jinja2.Template(
+    """
+{{indent}}{
+
+{{indent}}  const void *inputs[{{num_inputs}}];
+{{indent}}  {{inputs_initialization}}
+
+{{real_input_shape_defs}}
+
+{{indent}}  const {{index_type}} *real_input_shapes[{{num_real_input_shapes}}];
+{{indent}}  {{real_input_shapes_initialization}}
+
+{{all_input_shape_defs}}
+
+{{indent}}  const {{index_type}} *all_input_shapes[{{num_all_input_shapes}}];
+{{indent}}  {{all_input_shapes_initialization}}
+
+{{indent}}  {{index_type}} *{{output}}_shape[] = {
+{{indent}}    {{output_dim_refs}}
+{{indent}}  };
+
+{{indent}}  {{index_type}} concat_dim_sizes[{{num_concat_dim_sizes}}];
+{{indent}}  {{concat_dim_sizes_initialization}}
+
+{{indent}}  bool input_masks[{{num_input_masks}}];
+{{indent}}  {{input_masks_initialization}}
+
+{{indent}}  {{func_name}}(
+{{indent}}      {{output_ptr}},
+{{indent}}      {{output}}_shape,
+{{indent}}      inputs,
+{{indent}}      real_input_shapes,
+{{indent}}      all_input_shapes,
+{{indent}}      input_masks,
+{{indent}}      concat_dim_sizes,
+{{indent}}      {{concat_dim}}/*concat_dim*/,
+{{indent}}      {{rank}}/*rank*/,
+{{indent}}      {{num_real_inputs}}/*num_real_inputs*/,
+{{indent}}      {{num_all_inputs}}/*num_all_inputs*/,
+{{indent}}      stream
+{{indent}}  );
+{{indent}}}
+"""
+)
+
+
 FUNC_CALL_TEMPLATE = jinja2.Template(
     """
 {{indent}}{
@@ -709,6 +768,39 @@ def gen_function(
     )
 
 
+def _make_initialization_loops(init_var: str, init_values: List[str]):
+    def _make_loop_ranges(init_values: List[str]):
+        """
+        For the given list, return a list of tuples, where each tuple contains
+        (start_idx, end_idx, val). It means that in the input list, all the elements
+        between [start_idx, end_idx) have the same value 'val'
+        """
+        start_idx = 0
+        res = []
+        for end_idx in range(1, len(init_values)):
+            if init_values[end_idx] == init_values[end_idx - 1]:
+                continue
+            res.append((start_idx, end_idx, init_values[start_idx]))
+            start_idx = end_idx
+        if len(init_values) > 0:
+            res.append((start_idx, len(init_values), init_values[start_idx]))
+
+        return res
+
+    loop_ranges = _make_loop_ranges(init_values)
+    loop_range_strs = []
+    for (start_idx, end_idx, val) in loop_ranges:
+        loop_range_strs.append(
+            INITIALIZATION_LOOP_TEMPLATE.render(
+                var_name=init_var,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                init_val=val,
+            )
+        )
+    return "\n".join(loop_range_strs)
+
+
 def gen_function_call(
     func_attrs,
     backend_spec,
@@ -742,21 +834,48 @@ def gen_function_call(
     y = func_attrs["outputs"][0]
     concat_dim = func_attrs["concat_dim"]
 
-    input_names = ",\n      ".join([i._attrs["name"] for i in inputs])
+    input_names = [i._attrs["name"] for i in inputs]
     real_input_shape_defs = []
     real_input_shape_names = []
+    # It's not uncommon that multiple shape definitions share the same
+    # dimension values. In such a case, we could keep a single definition.
+    # In some rare cases, this little trick can dramatically reduce the
+    # number of lines generated for the relevant concatenate op and thus
+    # may improve the compilation time. Currently, we only enable this
+    # optimization for cases where we care about compilation time, as
+    # for most cases, the unoptimized version can generate more readable
+    # code while having little impact to the compilation time.
+    seen_input_shape_dims = {}
+    input_shape_name_subs = {}
+    optimize_for_compilation_time = Target.current()._kwargs.get(
+        "optimize_for_compilation_time", False
+    )
+
+    def _make_dims_key(dims):
+        dim_vals = [
+            str(d.value()) if isinstance(d, IntImm) else d._attrs["name"] for d in dims
+        ]
+        return ",".join(dim_vals)
+
     for idx, (i, input_accessor) in enumerate(zip(inputs, input_accessors)):
         input_shape_name = f'{i._attrs["name"]}_shape_{idx}'
         orig_input_shape = input_accessor.original_shapes
         dims = ", ".join([dim._attrs["name"] for dim in orig_input_shape])
-        one_shape_def = INPUT_SHAPE_DEF_TEMPLATE.render(
-            indent="      ",
-            input_shape_name=input_shape_name,
-            input_dims=dims,
-            index_type=backend_spec.index_type,
-        )
-        real_input_shape_defs.append(one_shape_def)
-        real_input_shape_names.append(input_shape_name)
+        dims_key = _make_dims_key(orig_input_shape)
+        seen_shape_name = seen_input_shape_dims.get(dims_key, None)
+        if not optimize_for_compilation_time or seen_shape_name is None:
+            one_shape_def = INPUT_SHAPE_DEF_TEMPLATE.render(
+                indent="      ",
+                input_shape_name=input_shape_name,
+                input_dims=dims,
+                index_type=backend_spec.index_type,
+            )
+            real_input_shape_defs.append(one_shape_def)
+            real_input_shape_names.append(input_shape_name)
+            seen_input_shape_dims[dims_key] = input_shape_name
+        else:
+            real_input_shape_names.append(seen_shape_name)
+            input_shape_name_subs[input_shape_name] = seen_shape_name
 
     y_shape = y._attrs["shape"]
     y_dim_refs = ", ".join(["&" + dim._attrs["name"] for dim in y_shape])
@@ -774,13 +893,12 @@ def gen_function_call(
         dim = input_accessor.original_shapes[concat_dim]._attrs["name"]
         concat_dim_sizes[input_index] = dim
 
-    input_masks_str = ", ".join(
-        ["true" if mask is True else "false" for mask in input_masks]
-    )
+    input_mask_values = ["true" if mask is True else "false" for mask in input_masks]
 
     # all input shape defs and names, including those that are masked out
     all_input_shape_defs = []
     all_input_shape_names = []
+    seen_input_shape_dims = {}
     # first, create shape defs for inputs that have been masked off
     for (
         mask,
@@ -792,37 +910,91 @@ def gen_function_call(
                 dims = ", ".join(
                     [str(dim._attrs["values"][0]) for dim in orig_input._attrs["shape"]]
                 )
-                one_shape_def = INPUT_SHAPE_DEF_TEMPLATE.render(
-                    indent="      ",
-                    input_shape_name=orig_input_shape_name,
-                    input_dims=dims,
-                    index_type=backend_spec.index_type,
-                )
-                all_input_shape_defs.append(one_shape_def)
-            all_input_shape_names.append(orig_input_shape_name)
+                dims_key = _make_dims_key(orig_input._attrs["shape"])
+                seen_shape_name = seen_input_shape_dims.get(dims_key, None)
+                if not optimize_for_compilation_time or seen_shape_name is None:
+                    one_shape_def = INPUT_SHAPE_DEF_TEMPLATE.render(
+                        indent="      ",
+                        input_shape_name=orig_input_shape_name,
+                        input_dims=dims,
+                        index_type=backend_spec.index_type,
+                    )
+                    all_input_shape_defs.append(one_shape_def)
+                    seen_input_shape_dims[dims_key] = orig_input_shape_name
+                    all_input_shape_names.append(orig_input_shape_name)
+                else:
+                    all_input_shape_names.append(seen_shape_name)
+            else:
+                all_input_shape_names.append(orig_input_shape_name)
         else:
             all_input_shape_names.append("")
     # update all_input_shapes with real input shapes
     for idx, (input_tensor, input_index) in enumerate(zip(inputs, input_indices)):
         input_shape_name = f'{input_tensor._attrs["name"]}_shape_{idx}'
+        sub_name = input_shape_name_subs.get(input_shape_name, None)
+        if sub_name is not None:
+            input_shape_name = sub_name
         all_input_shape_names[input_index] = input_shape_name
 
-    return FUNC_CALL_TEMPLATE.render(
-        indent=indent,
-        inputs=input_names,
-        real_input_shape_defs="".join(real_input_shape_defs),
-        real_input_shapes=", ".join(real_input_shape_names),
-        all_input_shape_defs="".join(all_input_shape_defs),
-        all_input_shapes=", ".join(all_input_shape_names),
-        input_masks=input_masks_str,
-        concat_dim_sizes=", ".join(concat_dim_sizes),
-        output_dim_refs=y_dim_refs,
-        func_name=func_attrs["name"],
-        output=y._attrs["name"],
-        output_ptr=y._attrs["name"],
-        concat_dim=concat_dim,
-        rank=len(orig_x._attrs["shape"]),
-        num_real_inputs=len(inputs),
-        num_all_inputs=len(original_inputs),
-        index_type=backend_spec.index_type,
-    )
+    if optimize_for_compilation_time:
+        inputs_initialization = _make_initialization_loops("inputs", input_names)
+        real_input_shapes_initialization = _make_initialization_loops(
+            "real_input_shapes", real_input_shape_names
+        )
+        all_input_shapes_initialization = _make_initialization_loops(
+            "all_input_shapes", all_input_shape_names
+        )
+        concat_dim_sizes_initialization = _make_initialization_loops(
+            "concat_dim_sizes", concat_dim_sizes
+        )
+        input_masks_initialization = _make_initialization_loops(
+            "input_masks", input_mask_values
+        )
+
+        # A special version that aims for reducing compilation time for some uncommon
+        # cases, e.g. where we have more than 100 concatenate ops, each of which taking
+        # thousands of real inputs.
+        return FUNC_CALL_TEMPLATE_OPT.render(
+            indent=indent,
+            num_inputs=len(input_names),
+            inputs_initialization=inputs_initialization,
+            real_input_shape_defs="".join(real_input_shape_defs),
+            num_real_input_shapes=len(real_input_shape_names),
+            real_input_shapes_initialization=real_input_shapes_initialization,
+            all_input_shape_defs="".join(all_input_shape_defs),
+            num_all_input_shapes=len(all_input_shape_names),
+            all_input_shapes_initialization=all_input_shapes_initialization,
+            num_input_masks=len(input_mask_values),
+            input_masks_initialization=input_masks_initialization,
+            num_concat_dim_sizes=len(concat_dim_sizes),
+            concat_dim_sizes_initialization=concat_dim_sizes_initialization,
+            output_dim_refs=y_dim_refs,
+            func_name=func_attrs["name"],
+            output=y._attrs["name"],
+            output_ptr=y._attrs["name"],
+            concat_dim=concat_dim,
+            rank=len(orig_x._attrs["shape"]),
+            num_real_inputs=len(inputs),
+            num_all_inputs=len(original_inputs),
+            index_type=backend_spec.index_type,
+        )
+    else:
+        return FUNC_CALL_TEMPLATE.render(
+            indent=indent,
+            inputs=",\n      ".join(input_names),
+            real_input_shape_defs="".join(real_input_shape_defs),
+            real_input_shapes=", ".join(real_input_shape_names),
+            all_input_shape_defs="".join(all_input_shape_defs),
+            all_input_shapes=", ".join(all_input_shape_names),
+            input_masks=", ".join(input_mask_values),
+            concat_dim_sizes=", ".join(concat_dim_sizes),
+            output_dim_refs=y_dim_refs,
+            func_name=func_attrs["name"],
+            output=y._attrs["name"],
+            output_ptr=y._attrs["name"],
+            concat_dim=concat_dim,
+            rank=len(orig_x._attrs["shape"]),
+            num_real_inputs=len(inputs),
+            num_all_inputs=len(original_inputs),
+            index_type=backend_spec.index_type,
+        )

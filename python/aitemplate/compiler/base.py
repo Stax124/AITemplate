@@ -364,6 +364,9 @@ class IntImm(IntVar):
             and self._attrs["values"] == another._attrs["values"]
         )
 
+    def __hash__(self) -> int:
+        return super().__hash__()
+
     def value(self) -> int:
         """Returns value of this IntImm."""
         return self._attrs["values"][0]
@@ -747,6 +750,7 @@ class Tensor(Node):
         skip_constant_folding: bool = False,
         check_nan_and_inf: bool = False,
         check_outputs: bool = False,
+        original_name: str = None,
     ) -> None:
         """Initializes a Tensor.
 
@@ -783,6 +787,8 @@ class Tensor(Node):
             Whether or not to check this tensor is nan or inf during runtime.
         check_outputs : bool, optional
             Whether or not to print this tensor's value out during runtime.
+        original_name : str, optional
+            Original name of this tensor before making it AIT friendly
         """
         super().__init__()
         self._attrs["shape"] = self._convert_shape(shape)
@@ -826,6 +832,7 @@ class Tensor(Node):
 
         self._attrs["check_nan_and_inf"] = check_nan_and_inf
         self._attrs["check_outputs"] = check_outputs
+        self._attrs["original_name"] = original_name
 
     def __str__(self) -> str:
         output = {}

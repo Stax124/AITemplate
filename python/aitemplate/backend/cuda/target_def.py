@@ -135,8 +135,8 @@ class CUDA(Target):
     def get_host_compiler_options(self) -> List[str]:
         return self._build_gnu_host_compiler_options()
 
-    def _get_nvcc_debug_options(self) -> str:
-        CUDA_DEBUG_LEVEL_STRINGS = ["", "-lineinfo", "-g -G"]
+    def _get_nvcc_debug_options(self) -> List[str]:
+        CUDA_DEBUG_LEVEL_STRINGS = [[], ["-lineinfo"], ["-g", "-G"]]
         level = environ.get_cuda_nvcc_debug_level()
         if level.isdigit():
             level = int(level)
@@ -144,7 +144,7 @@ class CUDA(Target):
                 level >= 0 and level < 3
             ), "Debug level out of range. Must be 0 (no debug info), 1 (lineinfo) or 2 (with debug info, disable opt)"
             return CUDA_DEBUG_LEVEL_STRINGS[level]
-        return level
+        return [level]
 
     def _build_nvcc_compiler_options(self) -> List[str]:
         code = [f"sm_{self._arch}", f"compute_{self._arch}"]
@@ -158,6 +158,7 @@ class CUDA(Target):
             environ.get_compiler_opt_level(),
             "-std=c++17",
             "--expt-relaxed-constexpr",
+            "-DCUTLASS_DEBUG_TRACE_LEVEL=" + environ.get_cutlass_debug_trace_level(),
         ]
         if environ.enable_ptxas_info():
             options.extend(
@@ -169,7 +170,7 @@ class CUDA(Target):
                     "--source-in-ptx",
                 ]
             ),  # Annotate the ptx file with source information
-        options.append(self._get_nvcc_debug_options())
+        options.extend(self._get_nvcc_debug_options())
         if self._ndebug == 1:
             options.append("-DNDEBUG")
         if environ.use_fast_math() and (
@@ -178,8 +179,17 @@ class CUDA(Target):
             options.extend(
                 [
                     "--use_fast_math",
-                    "-DCUTLASS_USE_TANH_FOR_SIGMOID=1",
                     "-DAIT_USE_FAST_MATH=1",
+                ]
+            )
+        if (
+            self._kwargs.get("use_tanh_for_sigmoid", False)
+            or environ.use_tanh_for_sigmoid()
+        ):
+            options.extend(
+                [
+                    "-DAIT_USE_TANH_FOR_SIGMOID=1",
+                    "-DCUTLASS_USE_TANH_FOR_SIGMOID=1",
                 ]
             )
         return options
@@ -225,7 +235,17 @@ class CUDA(Target):
         super().__enter__()
         self._gen_cutlass_lib_pkg()
         f_gen_ops = registry.get("cuda.gen_cutlass_ops")
-        self._operators = f_gen_ops(self._arch, self._cuda_version)
+        allow_cutlass_sm90 = (
+            self._kwargs.get("allow_cutlass_sm90", False)
+            or environ.allow_cutlass_sm90_kernels()
+        )
+        force_cutlass_sm90 = (
+            self._kwargs.get("force_cutlass_sm90", False)
+            or environ.force_cutlass_sm90_kernels()
+        )
+        self._operators = f_gen_ops(
+            self._arch, self._cuda_version, allow_cutlass_sm90, force_cutlass_sm90
+        )
 
     def __exit__(self, ptype, value, trace):
         super().__exit__(ptype, value, trace)
@@ -233,7 +253,10 @@ class CUDA(Target):
             shutil.rmtree(self.lib_folder)
 
     def cc(self):
-        return "nvcc"
+        cc = "nvcc"
+        if environ.nvcc_ccbin():
+            cc += " -ccbin " + environ.nvcc_ccbin()
+        return cc
 
     def compile_cmd(self, executable=False):
         if executable:
@@ -265,6 +288,7 @@ class FBCUDA(CUDA):
     nvcc_option_json = None
     cutlass_path_ = None
     static_compile_options_ = None
+    optimize_for_compilation_time_ = False
 
     def __init__(self, arch="80", remote_cache_bytes=None, **kwargs):
         from libfb.py import parutil
@@ -272,16 +296,22 @@ class FBCUDA(CUDA):
         cutlass_src_path = parutil.get_dir_path(
             "aitemplate/AITemplate/fb/3rdparty/cutlass"
         )
-        cub_src_path = parutil.get_dir_path("aitemplate/AITemplate/fb/3rdparty/cub")
         static_files_path = parutil.get_dir_path("aitemplate/AITemplate/static")
+        if "optimize_for_compilation_time" in kwargs:
+            FBCUDA.optimize_for_compilation_time_ = kwargs[
+                "optimize_for_compilation_time"
+            ]
+        _LOGGER.info(
+            "Optimize for compilation time : {}".format(
+                FBCUDA.optimize_for_compilation_time_
+            )
+        )
         self._include_path = None
         if not FBCUDA.cutlass_path_:
             self._include_path = tempfile.mkdtemp()
 
             FBCUDA.cutlass_path_ = self._include_path + "/cutlass"
-            self.cub_path_ = self._include_path + "/cub"
             shutil.copytree(cutlass_src_path, FBCUDA.cutlass_path_)
-            shutil.copytree(cub_src_path, self.cub_path_)
 
             attention_src_path = parutil.get_dir_path(
                 "aitemplate/AITemplate/python/aitemplate/backend/cuda/attention/src"
@@ -403,9 +433,18 @@ class FBCUDA(CUDA):
                     "--expt-relaxed-constexpr",
                     f"-gencode=arch=compute_{nvcc_arch},code=[sm_{nvcc_arch},compute_{nvcc_arch}]",
                     "-Xcompiler=-Wconversion",
-                    environ.get_compiler_opt_level(),
+                    environ.get_compiler_opt_level()
+                    if not FBCUDA.optimize_for_compilation_time_
+                    else "-O1",
                     "-std=c++17",
+                    "-DCUTLASS_DEBUG_TRACE_LEVEL="
+                    + environ.get_cutlass_debug_trace_level(),
                 ]
+                + (
+                    ["-DOPTIMIZE_FOR_COMPILATION_TIME"]
+                    if FBCUDA.optimize_for_compilation_time_
+                    else []
+                )
             )
             if environ.enable_ptxas_info():
                 options.extend(
@@ -417,7 +456,7 @@ class FBCUDA(CUDA):
                         "--source-in-ptx",  # Annotate the ptx file with source information
                     ]
                 ),
-            options.append(self._get_nvcc_debug_options())
+            options.extend(self._get_nvcc_debug_options())
             if self._ndebug == 1:
                 options.append("-DNDEBUG")
             FBCUDA.static_compile_options_ = options
@@ -428,8 +467,17 @@ class FBCUDA(CUDA):
             compile_options.extend(
                 [
                     "--use_fast_math",
-                    "-DCUTLASS_USE_TANH_FOR_SIGMOID=1",
                     "-DAIT_USE_FAST_MATH=1",
+                ]
+            )
+        if (
+            self._kwargs.get("use_tanh_for_sigmoid", False)
+            or environ.use_tanh_for_sigmoid()
+        ):
+            compile_options.extend(
+                [
+                    "-DAIT_USE_TANH_FOR_SIGMOID=1",
+                    "-DCUTLASS_USE_TANH_FOR_SIGMOID=1",
                 ]
             )
         compile_options_str = " ".join(compile_options)

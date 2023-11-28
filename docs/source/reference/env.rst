@@ -14,6 +14,10 @@ Codegen
 
 **AIT_COMPILER_OPT**: The optimization level for a compiler, which is directly passed to the host compiler command line. AITemplate host code may be very light in certain cases, so there is nothing to optimize for a host compiler. Thus, there is no need to make host compiler perform time costly optimizations. It may be very useful to use "-O0" value for debugging GPU kernels. "-O3" by default.
 
+**AIT_NVCC_CCBIN**: nvcc host compiler (ccbin).
+
+**AIT_ENABLE_CUDA_LTO**: If set to "1", nvcc will use LTO flags during compilation. Default value is "0".
+
 **AIT_TIME_COMPILATION**: If set to "1", time each make command at the compilation time. This helps us to do compilation time analysis. Requires to install `time <https://man7.org/linux/man-pages/man1/time.1.html>`_ package.
 
 **AIT_MULTISTREAM_MODE**: Controls multi-stream mode. Default mode is "0".
@@ -70,3 +74,5 @@ Miscellaneous
 **AIT_PLOT_SHORTEN_TENSOR_NAMES**: If set to "1", shorten too long tensor names for a plot of a model graph, thus making a plot much easier to analyze visually. "0" by default.
 
 **AIT_USE_FAST_MATH**: If set to "0", no fast math option will be used for the device code generation. Default value is "1".
+
+**AIT_USE_TANH_FOR_SIGMOID**: If set to "1", tanh will be used to approximate sigmoid during device code generation. Default value is "0".

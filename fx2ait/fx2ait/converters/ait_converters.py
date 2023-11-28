@@ -15,13 +15,14 @@
 import logging
 import math
 import operator
-from typing import Dict, List, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from aitemplate.compiler.public import (
     avg_pool2d,
     bmm_rrr,
+    cast,
     chunk,
     clamp,
     concatenate,
@@ -41,6 +42,7 @@ from aitemplate.compiler.public import (
     getitem,
     group_norm,
     identity,
+    index_select,
     IntImm,
     IntVar,
     IntVarTensor,
@@ -50,7 +52,9 @@ from aitemplate.compiler.public import (
     ndhwc3to8,
     pad_last_dim,
     permute,
+    reduce_max,
     reduce_mean,
+    reduce_min,
     reduce_sum,
     reshape,
     size,
@@ -117,6 +121,18 @@ def acc_ops_mul(
     name: str,
 ) -> ConverterOutput:
     return create_binary_op(FuncEnum.MUL, args, kwargs, name)
+
+
+@ait_converter(acc_ops.square)
+def acc_ops_square(
+    target: Target,
+    args: Tuple[Argument, ...],
+    kwargs: Dict[str, Argument],
+    name: str,
+) -> ConverterOutput:
+    new_kwargs = dict(kwargs.copy())
+    new_kwargs["other"] = new_kwargs["input"]
+    return create_binary_op(FuncEnum.MUL, args, new_kwargs, name)
 
 
 @ait_converter(acc_ops.div)
@@ -240,6 +256,26 @@ def acc_ops_mean(
     return create_reduce_op(reduce_mean, args, kwargs, name)
 
 
+@ait_converter(acc_ops.amax)
+def acc_ops_amax(
+    target: Target,
+    args: Tuple[Argument, ...],
+    kwargs: Dict[str, Argument],
+    name: str,
+) -> ConverterOutput:
+    return create_reduce_op(reduce_max, args, kwargs, name)
+
+
+@ait_converter(acc_ops.amin)
+def acc_ops_amin(
+    target: Target,
+    args: Tuple[Argument, ...],
+    kwargs: Dict[str, Argument],
+    name: str,
+) -> ConverterOutput:
+    return create_reduce_op(reduce_min, args, kwargs, name)
+
+
 @ait_converter(acc_ops.linear)
 def acc_ops_linear(
     target: Target,
@@ -307,8 +343,20 @@ def acc_ops_linalg_norm(
     input_val = kwargs["input"]
     if not isinstance(input_val, AITTensor):
         raise RuntimeError(f"Unexpected input for {name}: {input_val}")
+    if (
+        isinstance(kwargs["dim"], int)
+        and "ord" in kwargs
+        and kwargs["ord"] != 2
+        and kwargs["ord"] is not None
+    ):
+        # If dim is an int, the vector norm will be computed.
+        # For vector norm, the default ord is 2 if not specified
+        # otherwise, AIT hasn't implement it
+        raise RuntimeError("AIT linalg_norm only supports ord=2 use case!")
 
-    if "ord" not in kwargs or kwargs["ord"] != 2:
+    if not isinstance(kwargs["dim"], int) and (
+        "ord" not in kwargs or kwargs["ord"] != 2
+    ):
         raise RuntimeError("AIT linalg_norm only supports ord=2 use case!")
 
     # Hard code ord_kind=2 for l2 norm
@@ -438,36 +486,7 @@ def acc_ops_softmax(
     if not isinstance(input_val, AITTensor):
         raise RuntimeError(f"Unexpected input for {name}: {input_val}")
 
-    dim = kwargs["dim"]
-    rank = len(input_val.shape())
-    if dim < 0:
-        dim = rank + dim
-    if dim != rank - 1:
-        for i in range(dim + 1, rank):
-            unsupported = False
-            if isinstance(input_val.shape()[i], IntImm):
-                if input_val.shape()[i].value() != 1:
-                    unsupported = True
-            elif isinstance(input_val.shape()[i], IntVar):
-                unsupported = True
-            else:
-                raise RuntimeError(
-                    f"unknown dimension type={type(i)} in AITTensor={input_val}"
-                )
-
-            if unsupported:
-                raise ValueError(
-                    f"AIT softmax only supports dim=rank-1, got AITTensor={input_val}, "
-                    f"where dim={dim}, rank={rank}"
-                )
-        reshape_dim = size()(input_val)[: dim + 1]
-        reshape_val = reshape()(input_val, reshape_dim)
-        softmax_val = softmax()(reshape_val, -1)
-        return reshape()(
-            softmax_val, reshape_dim + [IntVarTensor(IntImm(1))] * (rank - dim - 1)
-        )
-
-    return softmax()(input_val, dim)
+    return softmax()(input_val, kwargs["dim"])
 
 
 @ait_converter(acc_ops.relu)
@@ -479,6 +498,31 @@ def acc_ops_relu(
         raise RuntimeError(f"Unexpected input for {name}: {input_val}")
 
     return elementwise(FuncEnum.RELU)(input_val)
+
+
+@ait_converter(acc_ops.elu)
+def acc_ops_elu(
+    target: Target, args: Tuple[Argument, ...], kwargs: Dict[str, Argument], name: str
+) -> ConverterOutput:
+    input_val = kwargs["input"]
+    if not isinstance(input_val, AITTensor):
+        raise RuntimeError(f"Unexpected input for {name}: {input_val}")
+
+    inputs = [input_val]
+    if "alpha" in kwargs:
+        if not isinstance(kwargs["alpha"], (int, float)):
+            raise RuntimeError(
+                f"When specified, alpha in {name} must be a scalar: {input_val}"
+            )
+        input_alpha = AITTensor(
+            shape=[],
+            dtype=input_val._attrs["dtype"],
+            name="alpha",
+            value=kwargs["alpha"],
+        )
+        inputs.append(input_alpha)
+
+    return elementwise(FuncEnum.ELU)(*inputs)
 
 
 @ait_converter(acc_ops.leaky_relu)
@@ -1094,7 +1138,7 @@ def ait_acc_ops_split(
         raise ValueError(f"Non-tensor inputs for {name}: {input_val}")
 
     split_size_or_sections = kwargs["split_size_or_sections"]
-    if not isinstance(split_size_or_sections, (int, list)):
+    if not isinstance(split_size_or_sections, (int, list, IntVarTensor)):
         raise ValueError(
             f"Unexpected value for split_size_or_sections in {name}: {split_size_or_sections}"
         )
@@ -1237,6 +1281,8 @@ def _choose_conv2d_op(
     Helper to choose conv2d vs. conv2d_bias op based on existence of bias
     and pad channel input dim to 4/8
     """
+    REQUIRED_ALIGNMENT = 8
+
     if transposed:
         if bias:
             return transposed_conv2d_bias(stride=stride, pad=pad, dilate=dilate)(
@@ -1245,15 +1291,25 @@ def _choose_conv2d_op(
         else:
             return transposed_conv2d(stride=stride, pad=pad, dilate=dilate)(x, weight)
     last_dim = x._attrs["shape"][-1]._attrs["values"][0]
-    # CUDA conv channel dim weights need to align w/ a multiple of 2/4/8
-    # if CI < 4, pad to 4; if 5 < CI < 8, pad to 8;
-    if last_dim < 4:
-        weight = pad_last_dim(len(weight._attrs["shape"]), 4)(weight)
-        x = pad_last_dim(len(x._attrs["shape"]), 4)(x)
-    elif last_dim % 2 != 0:
-        return RuntimeError(
-            f"Conv2d is not implemented for input channel dim {last_dim}: it needs to be aligned to a multiple of 2/4/8"
+    dtype = x._attrs["dtype"]
+    if dtype == "float16":
+        dtype_bytes = 2
+    elif dtype == "bfloat16":
+        dtype_bytes = 2
+    elif dtype == "float32":
+        dtype_bytes = 4
+    else:
+        raise NotImplementedError(f"Unsupported dtype: {dtype}")
+    last_dim_bytes = last_dim * dtype_bytes
+    # CUDA conv channel dim weight need to align w/ a multiple of REQUIRED_ALIGNMENT bytes.
+    if last_dim_bytes % REQUIRED_ALIGNMENT != 0:
+        new_dim_size = int(
+            ((last_dim_bytes // REQUIRED_ALIGNMENT) + 1)
+            * REQUIRED_ALIGNMENT
+            / dtype_bytes
         )
+        weight = pad_last_dim(len(weight._attrs["shape"]), new_dim_size)(weight)
+        x = pad_last_dim(len(x._attrs["shape"]), new_dim_size)(x)
     if bias:
         return conv2d_bias(stride=stride, pad=pad, dilate=dilate)(x, weight, bias)
     else:
@@ -1604,6 +1660,38 @@ def acc_ops_to_dtype(
     # It introduces a node in AIT graph which has is_input=True and is_output=True. The node name is output_xx
     # fx2ait throws error when doing the input name binding. So we need an identity layer.
     input_val = kwargs["input"]
+
+    def _get_cast_to_dtype_from_kwargs(
+        kwargs: Dict[str, Argument]
+    ) -> Optional[torch.dtype]:
+        torch_dtype_to_ait_dtype_str = {
+            torch.float: "float32",
+            torch.half: "float16",
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+        }
+        if "acc_out_ty" not in kwargs or not hasattr(kwargs["acc_out_ty"], "dtype"):
+            return None
+
+        if isinstance(kwargs["acc_out_ty"].dtype, torch.dtype):
+            return torch_dtype_to_ait_dtype_str.get(kwargs["acc_out_ty"].dtype)
+
+        elif isinstance(kwargs["acc_out_ty"].dtype, AITTensor):
+            return kwargs["acc_out_ty"].dtype.dtype()
+        return None
+
+    cast_dtype = _get_cast_to_dtype_from_kwargs(kwargs)
+    input_dtype = input_val.dtype() if isinstance(input_val, AITTensor) else None
+    if cast_dtype is not None and cast_dtype != input_dtype:
+        input_tys = ["float16", "float32", "float", "bfloat16", "bool"]
+        cast_tys = [
+            "float16",
+            "float32",
+            "float",
+            "bfloat16",
+        ]
+        if input_dtype in input_tys and cast_dtype in cast_tys:
+            return cast()(input_val, cast_dtype)
     return identity()(input_val)
 
 
@@ -1658,14 +1746,14 @@ def acc_ops_tile(
         for _ in range(input_dim_len - len(shape_dims)):
             shape_dims.insert(0, 1)
     if input_dim_len < len(shape_dims):
-        shape = input_val.shape()
+        new_shape = list(input_val.shape())
         for _ in range(len(shape_dims) - input_dim_len):
-            shape.insert(0, IntImm(1))
-        result = expand()(input_val, shape)
+            new_shape.insert(0, IntImm(1))
+        result = reshape()(input_val, new_shape)
 
     for i, shape in enumerate(shape_dims):
         # Avoid operate on batch_size dim
-        if input_val.shape()[i]._attrs["name"] is not None:
+        if result.shape()[i]._attrs["name"] is not None:
             continue
         cat_groups = [result] * shape
         result = concatenate()(cat_groups, dim=i)
@@ -1788,3 +1876,24 @@ def acc_ops_masked_select(
     mask = kwargs["mask"]
 
     return masked_select()(input_val, mask)
+
+
+@ait_converter(acc_ops.index_select)
+def acc_ops_index_select(
+    target: Target,
+    args: Tuple[Argument, ...],
+    kwargs: Dict[str, Argument],
+    name: str,
+) -> ConverterOutput:
+    input_val = args[0] if len(args) >= 1 else kwargs["input"]
+    dim = args[1] if len(args) >= 2 else kwargs["dim"]
+    index = args[2] if len(args) >= 3 else kwargs["index"]
+
+    if not isinstance(input_val, AITTensor):
+        raise RuntimeError(f"Non-tensor 'input' for {name}: {input_val}")
+    if not isinstance(dim, int):
+        raise RuntimeError(f"Non-int 'dim' for {name}: {dim}")
+    if not isinstance(index, AITTensor):
+        raise RuntimeError(f"Non-tensor 'index' for {name}: {index}")
+
+    return index_select(dim=dim)(x=input_val, dim_idxs=index)

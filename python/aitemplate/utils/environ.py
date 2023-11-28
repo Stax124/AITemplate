@@ -36,14 +36,23 @@ def get_compiler_opt_level() -> str:
     return compiler_opt
 
 
-def use_fast_math() -> str:
+def use_fast_math() -> bool:
     """
     Whether the fast math option should be used for the device code generation.
     Fast math implies the use of approximate math operations (say,
     a division operation), allowing to gain speed at the cost of accuracy.
-    Default value is "1".
+    Default value to get from environment variable is "1".
     """
     return os.getenv("AIT_USE_FAST_MATH", "1") == "1"
+
+
+def use_tanh_for_sigmoid() -> bool:
+    """
+    Whether the we want to use tanh to approximate sigmoid for the device code generation.
+    This controls both the code generation for AITemplate codegen and CUTLASS.
+    Default value to get from environment variable is "0".
+    """
+    return os.getenv("AIT_USE_TANH_FOR_SIGMOID", "0") == "1"
 
 
 def enable_cuda_lto() -> bool:
@@ -52,6 +61,13 @@ def enable_cuda_lto() -> bool:
     Default value is "0".
     """
     return os.getenv("AIT_ENABLE_CUDA_LTO", "0") == "1"
+
+
+def nvcc_ccbin() -> str:
+    """
+    nvcc host compiler (ccbin)
+    """
+    return os.getenv("AIT_NVCC_CCBIN", "")
 
 
 def force_profiler_cache() -> bool:
@@ -66,7 +82,6 @@ def force_profiler_cache() -> bool:
         assert (
             os.environ.get("FORCE_PROFILE", None) != "1"
         ), "cannot specify both AIT_FORCE_PROFILER_CACHE and FORCE_PROFILE"
-    _LOGGER.info(f"{force_cache=}")
     return force_cache
 
 
@@ -267,6 +282,14 @@ def get_cuda_nvcc_debug_level():
     regardless of what else is passed as optimization level.
     """
     level = os.getenv("AIT_CUDA_DEBUG_LEVEL", "0")
+    return level
+
+
+def get_cutlass_debug_trace_level():
+    """
+    Return level of CUTLASS lib debug trace information. Default to no debug info.
+    """
+    level = os.getenv("CUTLASS_DEBUG_TRACE_LEVEL", "0")
     return level
 
 

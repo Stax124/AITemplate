@@ -31,6 +31,7 @@ from aitemplate.backend.target import Target
 from aitemplate.compiler.base import (
     DynamicProfileStrategy,
     ExecItem,
+    IntImm,
     IntVar,
     Operator,
     Tensor,
@@ -203,9 +204,11 @@ class softmax(Operator):
                 "flattening input tensor before normalization is not supported yet"
             )
         dim = wrap_dim(dim, x._rank())
-        if dim != x._rank() - 1:
+
+        inner_dims = x.shape()[dim + 1 :]
+        if not all(isinstance(d, IntImm) for d in inner_dims):
             raise NotImplementedError(
-                f"softmax currently only supports dim=x._rank() - 1, dim={dim}, x._rank()={x._rank()}"
+                "inner dims must all be static; {dim=}, {x.shape()=}"
             )
 
         self._attrs["inputs"] = [x]
