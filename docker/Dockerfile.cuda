@@ -38,7 +38,7 @@ RUN bash /Install/install_doc_dep.sh
 
 
 # install Pytorch
-RUN --mount=type=cache,target=/root/.cache/pip pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+RUN --mount=type=cache,target=/root/.cache/pip pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 
 # install NVIDIA cuda-python
